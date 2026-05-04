@@ -42,6 +42,10 @@ Prediction uncertainty rises as the engine gets closer to failure, which is the 
 
 Prediction error also tends to increase near failure, reinforcing why uncertainty estimates matter in the late-life regime.
 
+### Prediction Distribution
+
+![Prediction Distribution](outputs/plots/prediction_distribution.png)
+
 ## Key Insight
 
 Deterministic models collapse uncertainty into a single curve, even when the future is ambiguous. The stochastic model exposes multiple plausible futures, and that uncertainty widens in the same region where operational risk is highest.
