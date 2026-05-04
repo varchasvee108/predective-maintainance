@@ -52,6 +52,7 @@ def main() -> None:
 
     det_error = np.abs(deterministic - true_rul)
     mean_error = np.abs(stochastic_mean - true_rul)
+    print("Deterministic vs Stochastic diff:", np.mean(np.abs(deterministic - stochastic_mean)))
 
     print(f"selected_engine_id={engine_id}")
     print(f"num_cycles={len(engine['cycles_full'])}")
@@ -62,7 +63,7 @@ def main() -> None:
     _plot_trajectory_main(
         cycles=cycles,
         true_rul=true_rul,
-        deterministic=deterministic,
+        deterministic_pred=deterministic,
         stochastic_mean=stochastic_mean,
         stochastic=stochastic,
         stochastic_min=stochastic_min,
@@ -237,7 +238,7 @@ def _run_engine_inference(model: RULModel, windows: torch.Tensor) -> dict[str, n
 def _plot_trajectory_main(
     cycles: np.ndarray,
     true_rul: np.ndarray,
-    deterministic: np.ndarray,
+    deterministic_pred: np.ndarray,
     stochastic_mean: np.ndarray,
     stochastic: np.ndarray,
     stochastic_min: np.ndarray,
@@ -245,17 +246,36 @@ def _plot_trajectory_main(
     path: Path,
 ) -> None:
     fig, ax = plt.subplots()
+    plot_deterministic = not np.allclose(deterministic_pred, stochastic_mean, atol=1e-3)
     failure_start = _first_crossing(cycles, true_rul, FAILURE_THRESHOLD)
     if failure_start is not None:
         ax.axvspan(failure_start, cycles[-1], color="#f7d6d9", alpha=0.25, label="RUL < 20")
 
-    ax.fill_between(cycles, stochastic_min, stochastic_max, color="#4c78a8", alpha=0.16, label="uncertainty band")
+    ax.fill_between(
+        cycles,
+        stochastic_min,
+        stochastic_max,
+        color="#4c78a8",
+        alpha=0.16,
+        label="uncertainty band",
+        zorder=1,
+    )
     for idx in range(stochastic.shape[0]):
-        ax.plot(cycles, stochastic[idx], color="#7ea6d8", linewidth=1.0, alpha=0.22)
+        ax.plot(cycles, stochastic[idx], color="#7ea6d8", linewidth=1.0, alpha=0.22, zorder=1.5)
 
-    ax.plot(cycles, true_rul, color="black", linewidth=3.0, label="true RUL")
-    ax.plot(cycles, deterministic, color="#d62728", linewidth=2.2, linestyle="--", label="deterministic")
-    ax.plot(cycles, stochastic_mean, color="#1f77b4", linewidth=3.0, label="stochastic mean")
+    ax.plot(cycles, true_rul, color="black", linewidth=2, label="true RUL", zorder=3)
+    ax.plot(cycles, stochastic_mean, color="#1f77b4", linewidth=2, label="stochastic mean", zorder=2)
+    if plot_deterministic:
+        ax.plot(
+            cycles,
+            deterministic_pred,
+            color="red",
+            linestyle="--",
+            linewidth=2,
+            alpha=0.9,
+            label="deterministic",
+            zorder=4,
+        )
 
     ax.annotate(
         "uncertainty increases near failure",
