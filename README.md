@@ -46,6 +46,8 @@ Prediction error also tends to increase near failure, reinforcing why uncertaint
 
 ![Prediction Distribution](outputs/plots/prediction_distribution.png)
 
+Multiple stochastic runs produce a spread of RUL predictions rather than a single value.This spread reflects uncertainty near failure, even when the mean prediction is imperfect.
+
 ## Key Insight
 
 Deterministic models collapse uncertainty into a single curve, even when the future is ambiguous. The stochastic model exposes multiple plausible futures, and that uncertainty widens in the same region where operational risk is highest.
