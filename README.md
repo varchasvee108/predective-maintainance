@@ -52,6 +52,14 @@ Multiple stochastic runs produce a spread of RUL predictions rather than a singl
 
 Deterministic models collapse uncertainty into a single curve, even when the future is ambiguous. The stochastic model exposes multiple plausible futures, and that uncertainty widens in the same region where operational risk is highest.
 
+## Limitations / Future Work
+
+- The model exhibits slight overestimation near failure, and uncertainty is not yet fully calibrated.
+
+- The current backbone uses an LSTM, which struggles with long-range temporal dependencies. Replacing it with a state-space model (e.g., Mamba) is expected to better capture long-horizon dynamics and improve late-stage prediction behavior.
+
+- The current stochastic approach uses simple noise injection. Extending this to a flow-matching objective is expected enable learning a richer conditional distribution over future states, improving the quality and consistency of uncertainty estimates.
+
 ## How to Run
 
 ```bash
