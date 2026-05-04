@@ -1,222 +1,267 @@
-# Project: RUL Prediction with Stochastic Trajectories
+# Project: RUL Prediction with Stochastic Trajectories (Single-Run, A100)
 
-## Goal
-Train a single end-to-end model for C-MAPSS FD001 that:
-1. predicts Remaining Useful Life (RUL),
-2. then produces multiple plausible RUL trajectories through a small noise-conditioned residual,
-3. so the final demo shows uncertainty, not just one line.
+## Objective
+Build a model that:
+1. Predicts Remaining Useful Life (RUL) from C-MAPSS FD001
+2. Generates multiple plausible future RUL predictions using stochastic residuals
+3. Demonstrates uncertainty increasing near failure
 
-This is a time-constrained build for one A100 40GB run path:
-- one smoke test to verify the pipeline,
-- one backbone training run,
-- one flow fine-tune run,
-- then evaluation + plots.
+Execution strategy:
+- 1 smoke test
+- 1 backbone training
+- 1 flow fine-tune
+- evaluation + plots
 
-Do not do hyperparameter sweeps, architecture search, or extra ablations unless the pipeline breaks.
-
----
-
-## Runtime constraints
-- Hardware: Nvidia A100 40GB on Modal
-- Budget: about $30
-- Goal: minimize wasted GPU time
-- Priority: correctness, speed, clean output
-- Training should be Modal-friendly and reproducible
+No experimentation loops.
 
 ---
 
 ## Dataset
-- Dataset: C-MAPSS FD001
-- Input: multivariate engine sensor time series
-- Use only sensors with useful variance
-- Drop constant / near-constant sensors
-- Normalize with z-score statistics fit on train only
-- Apply the same normalization to test
+
+### Source
+- C-MAPSS FD001
+
+### Preprocessing
+- Drop low-variance sensors (based on std threshold)
+- Keep ~14 sensors (log final selected indices)
+- Normalize using z-score:
+  - compute mean/std on TRAIN only
+  - apply same stats to train + test
+- Replace any NaNs after normalization with 0 (safety)
 
 ---
 
 ## Windowing
+
 - Window size: `T = 40`
 - Stride: `1`
-- Each sample is a sliding window of sensor history
-- Input shape: `(B, T, F)`
-- `F` should end up around 14-ish after filtering
+- Generate sliding windows per engine_id
+- Label = RUL at last timestep of window
+
+### Shapes
+- Input: `(B, T, F)`
+- Output: `(B,)`
+
+### Sanity Checks (must pass)
+- No NaNs in X or y
+- RUL strictly non-increasing within each engine
+- Feature count consistent across splits
 
 ---
 
-## Labels
-- Compute RUL per timestep
-- Cap RUL at `125`
-- Target shape: `(B,)`
+## RUL Computation
+
+- `RUL = max_cycle - current_cycle`
+- Cap:
+  - `RUL = min(RUL, 125)`
+- Normalize RUL optionally to [0,1] (only if training unstable; default = no)
 
 ---
 
-## Core model
+## Model Architecture
 
-### Backbone
-Use:
-- Conv1D frontend
-- Mamba sequence model
-- RUL regression head
+### Input reshape
+- `(B, T, F)` → `(B, F, T)` for Conv1D
+- Back to `(B, T, C)` after conv
 
-### Conv frontend
-- `Conv1d(F -> 64, kernel_size=3, padding=1)`
+---
+
+### Conv Encoder
+- Conv1d(F → 64, kernel=3, padding=1)
 - ReLU
-- `Conv1d(64 -> 128, kernel_size=3, padding=1)`
+- Conv1d(64 → 192, kernel=3, padding=1)
 - ReLU
-- Dropout `0.1`
+- Dropout(0.1)
 
-### Mamba backbone
-- `d_model = 128`
-- `n_layers = 2`
-- keep it small and stable
+Output:
+- `(B, T, 192)`
+
+---
+
+### Mamba Backbone
+- d_model = 192
+- n_layers = 2
+- Input: `(B, T, 192)`
+- Output: `(B, T, 192)`
+
+---
 
 ### Pooling
-Use last timestep pooling first:
-- `z_last = z[:, -1, :]`
-
-### RUL head
-- MLP: `128 -> 64 -> 1`
+- `z_last = z[:, -1, :]` → `(B, 192)`
+- (Optional fallback: mean pooling if unstable)
 
 ---
 
-## Flow module
+### RUL Head
+- MLP: 192 → 64 → 1
 
-This is **not** full diffusion.
-It is a small stochastic residual used to generate multiple plausible trajectories.
+---
+
+## Flow Module (Stochastic Residual)
 
 ### Noise
 - `noise_dim = 16`
-- sample `ε ~ N(0, I)`
+- `ε ~ N(0, I)` → `(B, 16)`
+
+### Noise Scaling (IMPORTANT for trajectories)
+- Scale noise based on degradation stage:
+  - `scale = sigmoid((125 - RUL_pred) / 125)`
+  - `ε = ε * scale`
+- Ensures:
+  - low variance early
+  - higher variance near failure
+
+---
+
+### Residual Input
+- concat(z_last, ε) → `(B, 208)`
+
+---
 
 ### Residual MLP
-Input:
-- concatenate `z_last` and `ε`
+- 208 → 192 → 192 → 192
+- ReLU between layers
 
-Structure:
-- `(128 + 16) -> 128 -> 128 -> 128`
+---
 
 ### Combine
 - `z_final = z_last + delta`
 
-### Final prediction
+---
+
+### Final Prediction
 - `RUL = head(z_final)`
 
 ---
 
-## Training plan
+## Training
 
-### Phase 0: smoke test
-Run one short end-to-end training pass on a small subset to verify:
-- dataset loading
-- windowing
-- model forward pass
-- loss backward pass
-- checkpoint save
-- inference sampling
-- plotting
-
-This is not for performance. It is only to catch broken code early.
-
-### Phase 1: backbone training
-Train the SSM model without flow first.
-This produces the base predictor.
-
-### Phase 2: flow fine-tune
-Load the backbone weights and train the residual noise module.
-Fine-tune lightly. Do not restart from scratch.
+### Loss
+- MSE
 
 ---
 
-## Loss
-- Main loss: MSE
-- No special diffusion loss
-- No auxiliary losses unless required for shape/debugging
-
----
-
-## Optimizer and training settings
+### Hyperparameters
+- Batch size: 128–256 (prefer 256 on A100)
+- Epochs: 10–15
 - Optimizer: Adam
-- Learning rate: `1e-3`
-- Batch size: `128`
-- Epochs: start with `10` to `15`
-- Gradient clipping: `1.0`
-- Mixed precision: enabled
-- Save best checkpoint only
-
-These are defaults, not a tuning playground.
+- LR: 1e-3
+- Gradient clipping: 1.0
+- Mixed precision: ON
+- Early stop if loss plateaus (optional)
 
 ---
 
-## Inference behavior
+### Performance Constraints (must hit)
+- One epoch ≤ 5 minutes on A100
+- No GPU underutilization (check batch size)
 
-### Deterministic mode
-- Use zero noise or disable flow
-- Produce a single RUL prediction
+---
 
-### Stochastic mode
-- Sample `N = 10` noise vectors
-- Produce multiple RUL predictions
-- Report:
+## Training Phases
+
+### Phase 0 — Smoke Test
+- 10–20% data
+- 1–2 epochs
+
+Verify:
+- forward + backward
+- no NaNs
+- checkpoint save/load
+- stochastic inference works
+- plot renders
+
+---
+
+### Phase 1 — Backbone Training
+- Train Conv + Mamba + head
+- No flow
+- Save best checkpoint
+
+---
+
+### Phase 2 — Flow Fine-Tune
+- Load backbone weights
+- Enable flow
+- Train 5–10 epochs
+- Lower LR if unstable
+
+---
+
+## Inference
+
+### Deterministic
+- ε = 0
+
+---
+
+### Stochastic
+- Sample N = 10
+- Output:
+  - predictions list
   - mean
-  - min/max range
-  - optional uncertainty band
+  - min/max
+  - (optional std)
 
 ---
 
-## What must be shown in the final output
-The main value of the project is not just RMSE.
+## Output Requirement (CRITICAL)
 
-The final demo must clearly show:
-1. a single predicted RUL curve,
-2. multiple sampled future trajectories,
-3. uncertainty increasing near failure.
+For ONE engine:
+
+Plot:
+- true RUL
+- predicted mean
+- 5–10 sampled trajectories
+
+Expected:
+- tight early predictions
+- spread increases near failure
 
 ---
 
 ## Metrics
-Track:
+
 - RMSE
 - MAE
 
-Also track one simple operational metric:
-- threshold crossing at `RUL < 20`
+---
+
+## Early Detection
+
+- threshold: RUL < 20
+- compare crossing timestep
 
 ---
 
-## Plots to generate
-1. True vs predicted RUL over time
-2. Multiple sampled trajectories for one engine
-3. Mean trajectory with uncertainty band
-4. Error vs time-to-failure
+## Failure Conditions (debug triggers)
 
-The trajectory plot is the main deliverable.
-
----
-
-## Project structure
-Keep the repository neat and easy to run on Modal.
-
-Recommended layout:
-- `config/`
-- `data/`
-- `models/`
-- `trainer/`
-- `scripts/`
-- `infra/`
-- `outputs/`
-
-Modal-specific code should live in `infra/`.
-Training logic should stay separate from infrastructure code.
+If any occur:
+- constant predictions → model collapse
+- no variance in trajectories → flow broken
+- exploding loss → normalization or LR issue
+- NaNs → data or AMP issue
 
 ---
 
-## Non-goals
-Do not build:
-- a reusable ML framework
-- a multi-agent system
-- a diffusion system
-- a hyperparameter search pipeline
-- unnecessary abstraction layers
+## Project Structure
 
-The goal is one strong, clean result.
+config/
+data/
+models/
+trainer/
+scripts/
+infra/
+outputs/
+
+---
+
+## Non-Goals
+
+- No diffusion models
+- No architecture search
+- No multi-run tuning
+- No unnecessary abstraction
+
+Goal:
+→ one clean, interpretable result with visible uncertainty
