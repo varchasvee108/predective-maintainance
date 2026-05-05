@@ -42,11 +42,11 @@ Prediction uncertainty rises as the engine gets closer to failure. While this al
 
 Prediction error also tends to increase near failure. The model's difficulty in this regime reinforces why exposing uncertainty is critical, even when that uncertainty is not yet perfectly aligned with true error.
 
-### Prediction Distribution
+<!-- ### Prediction Distribution
 
 ![Prediction Distribution](outputs/plots/prediction_distribution.png)
 
-Multiple stochastic runs produce a spread of RUL predictions. This spread exposes variability in predictions near failure, though it does not yet represent a calibrated set of plausible outcomes.
+Multiple stochastic runs produce a spread of RUL predictions. This spread exposes variability in predictions near failure, though it does not yet represent a calibrated set of plausible outcomes. -->
 
 ## Key Insight
 
