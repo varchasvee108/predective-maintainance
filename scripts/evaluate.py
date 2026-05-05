@@ -4,10 +4,13 @@ import sys
 from pathlib import Path
 
 import numpy as np
+
 try:
     import torch
 except ImportError as exc:
-    raise SystemExit("PyTorch is missing. Install torch before running evaluation.") from exc
+    raise SystemExit(
+        "PyTorch is missing. Install torch before running evaluation."
+    ) from exc
 from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,22 +23,20 @@ from model.rul_model import RULModel
 
 SEED = 42
 BATCH_SIZE = 256
-STOCHASTIC_SAMPLES = 10
-BACKBONE_PATH = ROOT / "outputs" / "checkpoints" / "backbone_best.pt"
-FLOW_PATH = ROOT / "outputs" / "checkpoints" / "flow_best.pt"
+CHECKPOINT_PATH = ROOT / "outputs" / "checkpoints" / "v2" / "v2_best.pt"
 
 
 def main() -> None:
-    if not BACKBONE_PATH.exists():
-        raise FileNotFoundError(f"Backbone checkpoint not found: {BACKBONE_PATH}")
-    if not FLOW_PATH.exists():
-        raise FileNotFoundError(f"Flow checkpoint not found: {FLOW_PATH}")
+    if not CHECKPOINT_PATH.exists():
+        raise FileNotFoundError(f"V2 checkpoint not found: {CHECKPOINT_PATH}")
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data = load_smoke_data(ROOT / "data" / "raw", smoke_fraction=1.0, val_fraction=0.2, seed=SEED)
+    data = load_smoke_data(
+        ROOT / "data" / "raw", smoke_fraction=1.0, val_fraction=0.2, seed=SEED
+    )
     test_loader = DataLoader(
         RULWindowDataset(data.test),
         batch_size=BATCH_SIZE,
@@ -44,106 +45,88 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    baseline_model = _load_model(
-        checkpoint_path=BACKBONE_PATH,
-        feature_dim=data.test.x.shape[-1],
-        device=device,
-        use_residual=False,
-    )
-    flow_model = _load_model(
-        checkpoint_path=FLOW_PATH,
-        feature_dim=data.test.x.shape[-1],
-        device=device,
-        use_residual=True,
+    model = _load_model(
+        CHECKPOINT_PATH, feature_dim=data.test.x.shape[-1], device=device
     )
 
-    true_rul, baseline_pred, stochastic_mean = _run_inference(
-        baseline_model=baseline_model,
-        flow_model=flow_model,
+    true_rul, q50_pred, q10_pred, q90_pred = _run_inference(
+        model=model,
         loader=test_loader,
         device=device,
     )
 
-    rmse_baseline = _rmse(true_rul, baseline_pred)
-    rmse_stochastic = _rmse(true_rul, stochastic_mean)
-    mae_baseline = _mae(true_rul, baseline_pred)
-    mae_stochastic = _mae(true_rul, stochastic_mean)
-    rmse_pct_diff = ((rmse_stochastic - rmse_baseline) / rmse_baseline) * 100.0
+    # Rescale from normalised [0, 1] space back to original RUL range
+    q10_pred = q10_pred * 125.0
+    q50_pred = q50_pred * 125.0
+    q90_pred = q90_pred * 125.0
+
+    rmse = _rmse(true_rul, q50_pred)
+    mae = _mae(true_rul, q50_pred)
+    coverage = np.mean((true_rul >= q10_pred) & (true_rul <= q90_pred))
+    crossing_rate = np.mean((q10_pred > q50_pred) | (q50_pred > q90_pred))
+    avg_width = (q90_pred - q10_pred).mean()
 
     print("Evaluation on full FD001 test set")
     print(f"test_windows={len(true_rul)}")
-    print(f"RMSE_baseline={rmse_baseline:.4f}")
-    print(f"RMSE_stochastic={rmse_stochastic:.4f}")
-    print(f"MAE_baseline={mae_baseline:.4f}")
-    print(f"MAE_stochastic={mae_stochastic:.4f}")
-    print(f"RMSE_percent_difference={rmse_pct_diff:.2f}%")
-
-    if rmse_pct_diff < 0:
-        print(f"Stochastic mean improves RMSE by {abs(rmse_pct_diff):.2f}%")
-    elif rmse_pct_diff > 0:
-        print(f"Stochastic mean worsens RMSE by {rmse_pct_diff:.2f}%")
-    else:
-        print("Stochastic mean matches baseline RMSE exactly")
+    print(f"RMSE={rmse:.4f}")
+    print(f"MAE={mae:.4f}")
+    print(f"coverage_q10_q90={coverage:.4f}")
+    print(f"quantile_crossing_rate={crossing_rate:.4f}")
+    print(f"avg_interval_width={avg_width:.4f}")
 
 
 def _load_model(
     checkpoint_path: Path,
     feature_dim: int,
     device: torch.device,
-    use_residual: bool,
 ) -> RULModel:
-    model = RULModel(feature_dim=feature_dim).to(device)
+    model = RULModel(feature_dim=feature_dim, use_quantiles=True).to(device)
     state = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state["model_state"])
-    model.enable_residual(use_residual)
     model.eval()
     return model
 
 
-def calibrate(pred: torch.Tensor) -> torch.Tensor:
-    pred = torch.clamp(pred, 0.0, 125.0)
-    return 0.95 * pred
-
-
 def _run_inference(
-    baseline_model: RULModel,
-    flow_model: RULModel,
+    model: RULModel,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     true_all: list[torch.Tensor] = []
-    baseline_all: list[torch.Tensor] = []
-    stochastic_mean_all: list[torch.Tensor] = []
+    q10_all: list[torch.Tensor] = []
+    q50_all: list[torch.Tensor] = []
+    q90_all: list[torch.Tensor] = []
 
     with torch.no_grad():
         for x, y in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            baseline_pred = calibrate(baseline_model(x))
-            _assert_finite(baseline_pred, "baseline predictions")
+            pred = model(x)
+            _assert_finite(pred, "quantile predictions")
 
-            stochastic_preds = []
-            for _ in range(STOCHASTIC_SAMPLES):
-                epsilon = torch.randn(x.shape[0], flow_model.noise_dim, device=device, dtype=x.dtype)
-                pred = calibrate(flow_model(x, epsilon))
-                _assert_finite(pred, "stochastic predictions")
-                stochastic_preds.append(pred)
-            stochastic_mean = torch.stack(stochastic_preds, dim=0).mean(dim=0)
+            if pred.ndim != 2 or pred.shape[-1] != 3:
+                raise RuntimeError(
+                    f"Expected quantile output shape (B, 3), got {tuple(pred.shape)}. "
+                    "Make sure the checkpoint was trained with use_quantiles=True."
+                )
 
+            q10_all.append(pred[:, 0].cpu())
+            q50_all.append(pred[:, 1].cpu())
+            q90_all.append(pred[:, 2].cpu())
             true_all.append(y.cpu())
-            baseline_all.append(baseline_pred.cpu())
-            stochastic_mean_all.append(stochastic_mean.cpu())
 
     true_rul = torch.cat(true_all).numpy()
-    baseline_pred = torch.cat(baseline_all).numpy()
-    stochastic_mean = torch.cat(stochastic_mean_all).numpy()
+    q10_pred = torch.cat(q10_all).numpy()
+    q50_pred = torch.cat(q50_all).numpy()
+    q90_pred = torch.cat(q90_all).numpy()
 
     _assert_finite_np(true_rul, "true RUL")
-    _assert_finite_np(baseline_pred, "baseline predictions")
-    _assert_finite_np(stochastic_mean, "stochastic mean predictions")
+    _assert_finite_np(q10_pred, "q10 predictions")
+    _assert_finite_np(q50_pred, "q50 predictions")
+    _assert_finite_np(q90_pred, "q90 predictions")
 
-    return true_rul, baseline_pred, stochastic_mean
+    return true_rul, q50_pred, q10_pred, q90_pred
 
 
 def _rmse(target: np.ndarray, pred: np.ndarray) -> float:

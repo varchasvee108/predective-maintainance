@@ -92,7 +92,7 @@ def _run_inference(
                 windows.shape[0], model.noise_dim, device=device, dtype=windows.dtype
             )
             pred = calibrate(model(windows, epsilon))
-            pred = pred + 0.05 * torch.randn_like(pred) * pred.mean()
+            # pred = pred + 0.05 * torch.randn_like(pred) * pred.mean()
             _assert_finite_tensor(pred, "stochastic predictions")
             stochastic_preds.append(pred)
 

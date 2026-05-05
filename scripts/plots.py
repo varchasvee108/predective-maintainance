@@ -15,9 +15,10 @@ from core.data import load_smoke_data
 from model.rul_model import RULModel
 
 
-CHECKPOINT_PATH = ROOT / "outputs" / "checkpoints" / "flow_best.pt"
+CHECKPOINT_PATH = ROOT / "outputs" / "checkpoints" / "v2" / "v2_best.pt"
+BACKBONE_CHECKPOINT_PATH = ROOT / "outputs" / "checkpoints" / "backbone_best.pt"
 TEST_PATH = ROOT / "data" / "raw" / "test_FD001.txt"
-PLOTS_DIR = ROOT / "outputs" / "plots"
+PLOTS_DIR = ROOT / "outputs" / "plots" / "v2"
 SEED = 42
 WINDOW_SIZE = 40
 STOCHASTIC_SAMPLES = 10
@@ -32,27 +33,54 @@ def main() -> None:
 
     if not CHECKPOINT_PATH.exists():
         raise FileNotFoundError(f"Flow checkpoint not found: {CHECKPOINT_PATH}")
+    if not BACKBONE_CHECKPOINT_PATH.exists():
+        raise FileNotFoundError(
+            f"Backbone checkpoint not found: {BACKBONE_CHECKPOINT_PATH}"
+        )
 
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     _set_plot_style()
 
-    prep = load_smoke_data(ROOT / "data" / "raw", smoke_fraction=1.0, val_fraction=0.2, seed=SEED)
-    model = _load_model(feature_dim=len(prep.selected_sensors))
+    prep = load_smoke_data(
+        ROOT / "data" / "raw", smoke_fraction=1.0, val_fraction=0.2, seed=SEED
+    )
+    flow_model = _load_model(
+        feature_dim=len(prep.selected_sensors),
+        checkpoint_path=CHECKPOINT_PATH,
+        use_residual=True,
+    )
+    backbone_model = _load_model(
+        feature_dim=len(prep.selected_sensors),
+        checkpoint_path=BACKBONE_CHECKPOINT_PATH,
+        use_residual=False,
+    )
     engine_id, engine = _load_longest_engine(prep.selected_sensors, prep.mean, prep.std)
-    results = _run_engine_inference(model, engine["windows"])
+    results = _run_engine_inference(flow_model, backbone_model, engine["windows"])
 
     cycles = engine["cycles_valid"]
     true_rul = engine["true_rul_valid"]
     deterministic = results["deterministic"]
-    stochastic = results["stochastic"]
-    stochastic_mean = results["mean"]
-    stochastic_min = results["min"]
-    stochastic_max = results["max"]
-    stochastic_std = results["std"]
+    use_quantiles = results.get("use_quantiles", False)
+
+    if use_quantiles:
+        stochastic_mean = results["q50"]
+        stochastic_min = results["q10"]
+        stochastic_max = results["q90"]
+        stochastic = None
+        stochastic_std = results["q90"] - results["q10"]
+    else:
+        stochastic = results["stochastic"]
+        stochastic_mean = results["mean"]
+        stochastic_min = results["min"]
+        stochastic_max = results["max"]
+        stochastic_std = results["std"]
 
     det_error = np.abs(deterministic - true_rul)
     mean_error = np.abs(stochastic_mean - true_rul)
-    print("Deterministic vs Stochastic diff:", np.mean(np.abs(deterministic - stochastic_mean)))
+    print(
+        "Deterministic vs Stochastic diff:",
+        np.mean(np.abs(deterministic - stochastic_mean)),
+    )
 
     print(f"selected_engine_id={engine_id}")
     print(f"num_cycles={len(engine['cycles_full'])}")
@@ -69,6 +97,7 @@ def main() -> None:
         stochastic_min=stochastic_min,
         stochastic_max=stochastic_max,
         path=PLOTS_DIR / "trajectory_main.png",
+        use_quantiles=use_quantiles,
     )
     _plot_uncertainty_growth(
         cycles=cycles,
@@ -77,7 +106,7 @@ def main() -> None:
         path=PLOTS_DIR / "uncertainty_growth.png",
     )
     _plot_prediction_distribution(
-        model=model,
+        model=flow_model,
         window=engine["windows"][-1:],
         true_rul=float(true_rul[-1]),
         path=PLOTS_DIR / "prediction_distribution.png",
@@ -114,12 +143,14 @@ def _set_plot_style() -> None:
     )
 
 
-def _load_model(feature_dim: int) -> RULModel:
+def _load_model(
+    feature_dim: int, checkpoint_path: Path, use_residual: bool
+) -> RULModel:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = RULModel(feature_dim=feature_dim).to(device)
-    state = torch.load(CHECKPOINT_PATH, map_location=device)
+    state = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state["model_state"])
-    model.enable_residual(True)
+    model.enable_residual(use_residual)
     model.eval()
     return model
 
@@ -141,7 +172,9 @@ def _load_longest_engine(
     engine_ids = raw_test[:, 0].astype(np.int64)
     cycles = raw_test[:, 1].astype(np.int64)
     sensors = raw_test[:, SENSOR_START_COL:].astype(np.float32)
-    sensor_idx = np.asarray([int(name.split("_")[1]) - 1 for name in selected_sensors], dtype=np.int64)
+    sensor_idx = np.asarray(
+        [int(name.split("_")[1]) - 1 for name in selected_sensors], dtype=np.int64
+    )
 
     unique_ids = np.unique(engine_ids)
     best_engine_id = None
@@ -195,44 +228,70 @@ def _load_longest_engine(
     }
 
 
-def _run_engine_inference(model: RULModel, windows: torch.Tensor) -> dict[str, np.ndarray]:
-    device = next(model.parameters()).device
+def _run_engine_inference(
+    flow_model: RULModel, backbone_model: RULModel, windows: torch.Tensor
+) -> dict[str, np.ndarray]:
+    device = next(flow_model.parameters()).device
     windows = windows.to(device)
     _assert_finite_tensor(windows, "inference windows")
 
+    # Detect quantile mode from a single probe forward pass
+    with torch.no_grad():
+        _probe = flow_model(windows[:1])
+    use_quantiles = _probe.ndim == 2 and _probe.shape[-1] == 3
+
     deterministic_preds = []
-    stochastic_preds = []
 
     with torch.no_grad():
         for idx in range(windows.shape[0]):
             x = windows[idx : idx + 1]
-            epsilon_zero = torch.zeros(1, model.noise_dim, device=device, dtype=x.dtype)
-            deterministic = calibrate(model(x, epsilon_zero))
+            deterministic = calibrate(backbone_model(x))
             deterministic_preds.append(deterministic.squeeze(0))
 
-            sample_preds = []
-            for _ in range(STOCHASTIC_SAMPLES):
-                epsilon = torch.randn(1, model.noise_dim, device=device, dtype=x.dtype)
-                pred = calibrate(model(x, epsilon))
-                sample_preds.append(pred.squeeze(0))
-            stochastic_preds.append(torch.stack(sample_preds, dim=0))
-
     deterministic_tensor = torch.stack(deterministic_preds, dim=0)
-    stochastic_tensor = torch.stack(stochastic_preds, dim=1)
-
     _assert_finite_tensor(deterministic_tensor, "deterministic predictions")
-    _assert_finite_tensor(stochastic_tensor, "stochastic predictions")
-
     deterministic_np = deterministic_tensor.cpu().numpy()
-    stochastic_np = stochastic_tensor.cpu().numpy()
-    return {
-        "deterministic": deterministic_np,
-        "stochastic": stochastic_np,
-        "mean": stochastic_np.mean(axis=0),
-        "min": stochastic_np.min(axis=0),
-        "max": stochastic_np.max(axis=0),
-        "std": stochastic_np.std(axis=0),
-    }
+
+    if use_quantiles:
+        with torch.no_grad():
+            pred = flow_model(windows)  # (N, 3)
+        _assert_finite_tensor(pred, "quantile predictions")
+        q10 = pred[:, 0].cpu().numpy()
+        q50 = pred[:, 1].cpu().numpy()
+        q90 = pred[:, 2].cpu().numpy()
+        return {
+            "use_quantiles": True,
+            "deterministic": deterministic_np,
+            "q10": q10,
+            "q50": q50,
+            "q90": q90,
+        }
+    else:
+        stochastic_preds = []
+        with torch.no_grad():
+            for idx in range(windows.shape[0]):
+                x = windows[idx : idx + 1]
+                sample_preds = []
+                for _ in range(STOCHASTIC_SAMPLES):
+                    epsilon = torch.randn(
+                        1, flow_model.noise_dim, device=device, dtype=x.dtype
+                    )
+                    pred = calibrate(flow_model(x, epsilon))
+                    sample_preds.append(pred.squeeze(0))
+                stochastic_preds.append(torch.stack(sample_preds, dim=0))
+
+        stochastic_tensor = torch.stack(stochastic_preds, dim=1)
+        _assert_finite_tensor(stochastic_tensor, "stochastic predictions")
+        stochastic_np = stochastic_tensor.cpu().numpy()
+        return {
+            "use_quantiles": False,
+            "deterministic": deterministic_np,
+            "stochastic": stochastic_np,
+            "mean": stochastic_np.mean(axis=0),
+            "min": stochastic_np.min(axis=0),
+            "max": stochastic_np.max(axis=0),
+            "std": stochastic_np.std(axis=0),
+        }
 
 
 def _plot_trajectory_main(
@@ -240,31 +299,64 @@ def _plot_trajectory_main(
     true_rul: np.ndarray,
     deterministic_pred: np.ndarray,
     stochastic_mean: np.ndarray,
-    stochastic: np.ndarray,
+    stochastic: np.ndarray | None,
     stochastic_min: np.ndarray,
     stochastic_max: np.ndarray,
     path: Path,
+    use_quantiles: bool = False,
 ) -> None:
     fig, ax = plt.subplots()
     plot_deterministic = not np.allclose(deterministic_pred, stochastic_mean, atol=1e-3)
     failure_start = _first_crossing(cycles, true_rul, FAILURE_THRESHOLD)
     if failure_start is not None:
-        ax.axvspan(failure_start, cycles[-1], color="#f7d6d9", alpha=0.25, label="RUL < 20")
+        ax.axvspan(
+            failure_start, cycles[-1], color="#f7d6d9", alpha=0.25, label="RUL < 20"
+        )
 
-    ax.fill_between(
-        cycles,
-        stochastic_min,
-        stochastic_max,
-        color="#4c78a8",
-        alpha=0.16,
-        label="uncertainty band",
-        zorder=1,
-    )
-    for idx in range(stochastic.shape[0]):
-        ax.plot(cycles, stochastic[idx], color="#7ea6d8", linewidth=1.0, alpha=0.22, zorder=1.5)
+    if use_quantiles:
+        # Quantile mode: fill q10–q90 band, no individual sample lines
+        ax.fill_between(
+            cycles,
+            stochastic_min,  # q10
+            stochastic_max,  # q90
+            color="#4c78a8",
+            alpha=0.20,
+            label="uncertainty band (q10–q90)",
+            zorder=1,
+        )
+        pred_label = "median (q50)"
+    else:
+        # Stochastic mode: spread fill + individual sample lines
+        ax.fill_between(
+            cycles,
+            stochastic_min,
+            stochastic_max,
+            color="#4c78a8",
+            alpha=0.16,
+            label="stochastic spread (uncalibrated)",
+            zorder=1,
+        )
+        if stochastic is not None:
+            for idx in range(stochastic.shape[0]):
+                ax.plot(
+                    cycles,
+                    stochastic[idx],
+                    color="#7ea6d8",
+                    linewidth=1.0,
+                    alpha=0.22,
+                    zorder=1.5,
+                )
+        pred_label = "stochastic mean"
 
     ax.plot(cycles, true_rul, color="black", linewidth=2, label="true RUL", zorder=3)
-    ax.plot(cycles, stochastic_mean, color="#1f77b4", linewidth=2, label="stochastic mean", zorder=2)
+    ax.plot(
+        cycles,
+        stochastic_mean,
+        color="#1f77b4",
+        linewidth=2,
+        label=pred_label,
+        zorder=2,
+    )
     if plot_deterministic:
         ax.plot(
             cycles,
@@ -273,19 +365,25 @@ def _plot_trajectory_main(
             linestyle="--",
             linewidth=2,
             alpha=0.9,
-            label="deterministic",
+            label="baseline (deterministic)",
             zorder=4,
         )
 
+    title = "Quantile RUL Trajectory" if use_quantiles else "Stochastic RUL Trajectory"
+    annotation_label = (
+        "uncertainty band widens near failure"
+        if use_quantiles
+        else "stochastic spread increases near failure"
+    )
     ax.annotate(
-        "uncertainty increases near failure",
+        annotation_label,
         xy=(cycles[-1], stochastic_mean[-1]),
         xytext=(cycles[max(0, len(cycles) // 2)], min(110.0, float(np.max(true_rul)))),
         arrowprops={"arrowstyle": "->", "lw": 1.4, "color": "#444444"},
         fontsize=12,
         color="#333333",
     )
-    ax.set_title("Stochastic RUL Trajectory")
+    ax.set_title(title)
     ax.set_xlabel("Cycle")
     ax.set_ylabel("RUL")
     ax.set_xlim(cycles[0], cycles[-1])
@@ -315,7 +413,9 @@ def _plot_uncertainty_growth(
     ax1.tick_params(axis="y", labelcolor="#1f77b4")
 
     ax2 = ax1.twinx()
-    ax2.plot(cycles, true_rul, color="black", linewidth=2.0, alpha=0.75, label="true RUL")
+    ax2.plot(
+        cycles, true_rul, color="black", linewidth=2.0, alpha=0.75, label="true RUL"
+    )
     ax2.set_ylabel("True RUL", color="black")
     ax2.tick_params(axis="y", labelcolor="black")
 
@@ -349,9 +449,18 @@ def _plot_prediction_distribution(
     mean_value = float(sample_array.mean())
 
     fig, ax = plt.subplots()
-    ax.hist(sample_array, bins=12, density=True, color="#7ea6d8", alpha=0.85, edgecolor="white")
+    ax.hist(
+        sample_array,
+        bins=12,
+        density=True,
+        color="#7ea6d8",
+        alpha=0.85,
+        edgecolor="white",
+    )
     ax.axvline(true_rul, color="black", linewidth=2.5, label="true RUL")
-    ax.axvline(mean_value, color="#1f77b4", linewidth=2.2, linestyle="--", label="sample mean")
+    ax.axvline(
+        mean_value, color="#1f77b4", linewidth=2.2, linestyle="--", label="sample mean"
+    )
     ax.set_title("Prediction Distribution Near Failure")
     ax.set_xlabel("Predicted RUL")
     ax.set_ylabel("Density")
@@ -371,8 +480,21 @@ def _plot_error_vs_time(
     smooth_det = _moving_average(det_error, window=5)
     smooth_mean = _moving_average(mean_error, window=5)
 
-    ax.plot(true_rul, smooth_det, color="#d62728", linewidth=2.0, linestyle="--", label="deterministic error")
-    ax.plot(true_rul, smooth_mean, color="#1f77b4", linewidth=2.5, label="stochastic mean error")
+    ax.plot(
+        true_rul,
+        smooth_det,
+        color="#d62728",
+        linewidth=2.0,
+        linestyle="--",
+        label="deterministic error",
+    )
+    ax.plot(
+        true_rul,
+        smooth_mean,
+        color="#1f77b4",
+        linewidth=2.5,
+        label="stochastic mean error",
+    )
     ax.axvspan(FAILURE_THRESHOLD, 0, color="#f7d6d9", alpha=0.22)
     ax.set_title("Absolute Error vs Time to Failure")
     ax.set_xlabel("Time to Failure (RUL)")
@@ -392,7 +514,9 @@ def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid")
 
 
-def _first_crossing(cycles: np.ndarray, values: np.ndarray, threshold: float) -> int | None:
+def _first_crossing(
+    cycles: np.ndarray, values: np.ndarray, threshold: float
+) -> int | None:
     idx = np.where(values < threshold)[0]
     if idx.size == 0:
         return None

@@ -66,7 +66,10 @@ def evaluate_loss(
             y = y.to(device, non_blocking=True)
             pred = model(x)
             _assert_finite(pred, "validation predictions")
-            loss = loss_fn(pred, y)
+            if pred.ndim == 2 and pred.shape[1] == 3:
+                loss = quantile_loss(pred, y)
+            else:
+                loss = loss_fn(pred, y)
             if not torch.isfinite(loss):
                 raise RuntimeError("Validation loss is NaN or infinity.")
             batch_size = int(x.shape[0])
@@ -116,6 +119,19 @@ def _train_one_epoch(
     if total_count == 0:
         raise RuntimeError("Training dataloader produced zero batches.")
     return total_loss / total_count
+
+
+def quantile_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Pinball (quantile) loss for three quantiles.
+
+    pred:   (B, 3) -> [q10, q50, q90]
+    target: (B,)
+    """
+    q = torch.tensor([0.1, 0.5, 0.9], device=pred.device, dtype=pred.dtype)
+    target = target.unsqueeze(1)          # (B, 1)
+    error = target - pred                 # (B, 3)
+    loss = torch.maximum(q * error, (q - 1) * error)
+    return loss.mean()
 
 
 def _assert_finite(tensor: torch.Tensor, name: str) -> None:

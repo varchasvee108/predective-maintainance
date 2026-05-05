@@ -19,11 +19,11 @@ image = (
     .add_local_dir(LOCAL_ROOT / "outputs", remote_path=f"{REMOTE_ROOT}/outputs")
 )
 
-app = modal.App(name="rul-backbone-train", image=image)
+app = modal.App(name="rul-v2-train", image=image)
 
 
 @app.function(gpu="A100", timeout=24 * 60 * 60)
-def run_backbone_training(
+def run_v2_training(
     epochs: int = 6,
     batch_size: int = 256,
     seed: int = 42,
@@ -32,21 +32,25 @@ def run_backbone_training(
 
     sys.path.insert(0, REMOTE_ROOT)
 
-    import scripts.flow_train as flow_train
+    import scripts.train_v2 as train_v2
 
-    flow_train.SEED = seed
-    flow_train.BATCH_SIZE = batch_size
-    flow_train.EPOCHS = epochs
-    flow_train.ROOT = Path(REMOTE_ROOT)
+    train_v2.SEED = seed
+    train_v2.BATCH_SIZE = batch_size
+    train_v2.EPOCHS = epochs
+    train_v2.ROOT = Path(REMOTE_ROOT)
 
-    print("starting remote flow training")
-    flow_train.main()
+    print("starting remote v2 training")
+    train_v2.main()
 
-    checkpoint_path = Path(REMOTE_ROOT) / "outputs" / "checkpoints" / "flow_best.pt"
+    checkpoint_path = (
+        Path(REMOTE_ROOT) / "outputs" / "checkpoints" / "v2" / "v2_best.pt"
+    )
     if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Flow checkpoint not found after training: {checkpoint_path}")
+        raise FileNotFoundError(
+            f"v2 checkpoint not found after training: {checkpoint_path}"
+        )
 
-    print(f"finished flow training, best checkpoint saved to {checkpoint_path}")
+    print(f"finished v2 training, best checkpoint saved to {checkpoint_path}")
     return {"checkpoint_bytes": checkpoint_path.read_bytes()}
 
 
@@ -56,16 +60,16 @@ def main(
     batch_size: int = 256,
     seed: int = 42,
 ) -> None:
-    result = run_backbone_training.remote(
+    result = run_v2_training.remote(
         epochs=epochs,
         batch_size=batch_size,
         seed=seed,
     )
 
-    output_dir = LOCAL_ROOT / "outputs" / "checkpoints"
+    output_dir = LOCAL_ROOT / "outputs" / "checkpoints" / "v2"
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / "flow_best.pt"
+    checkpoint_path = output_dir / "v2_best.pt"
     checkpoint_path.write_bytes(result["checkpoint_bytes"])
 
-    print("remote flow training complete")
+    print("remote v2 training complete")
     print(f"checkpoint_saved={checkpoint_path}")

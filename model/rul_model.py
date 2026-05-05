@@ -5,10 +5,17 @@ from torch import nn
 
 
 class RULModel(nn.Module):
-    def __init__(self, feature_dim: int, use_residual: bool = False, noise_dim: int = 16) -> None:
+    def __init__(
+        self,
+        feature_dim: int,
+        use_residual: bool = False,
+        noise_dim: int = 16,
+        use_quantiles: bool = False,
+    ) -> None:
         super().__init__()
         self.use_residual = use_residual
         self.noise_dim = noise_dim
+        self.use_quantiles = use_quantiles
         self.encoder = nn.Sequential(
             nn.Conv1d(feature_dim, 64, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -22,10 +29,11 @@ class RULModel(nn.Module):
             num_layers=2,
             batch_first=True,
         )
+        _head_out_dim = 3 if use_quantiles else 1
         self.head = nn.Sequential(
             nn.Linear(192, 64),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(64, _head_out_dim),
         )
         self.residual = nn.Sequential(
             nn.Linear(192 + noise_dim, 192),
@@ -36,11 +44,17 @@ class RULModel(nn.Module):
         )
         self._zero_init_residual_final_layer()
 
-    def forward(self, x: torch.Tensor, epsilon: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, epsilon: torch.Tensor | None = None
+    ) -> torch.Tensor:
         z_last = self.encode(x)
         if self.use_residual:
             z_last = self.apply_residual(z_last, epsilon)
-        return self.head(z_last).squeeze(-1)
+        out = self.head(z_last)
+        if self.use_quantiles:
+            out = torch.clamp(out, 0.0, 125.0)
+            return out  # shape (B, 3)
+        return out.squeeze(-1)  # shape (B,)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:
@@ -51,10 +65,14 @@ class RULModel(nn.Module):
         z, _ = self.lstm(z)
         return z[:, -1, :]
 
-    def apply_residual(self, z_last: torch.Tensor, epsilon: torch.Tensor | None) -> torch.Tensor:
+    def apply_residual(
+        self, z_last: torch.Tensor, epsilon: torch.Tensor | None
+    ) -> torch.Tensor:
         batch_size = z_last.shape[0]
         if epsilon is None:
-            epsilon = torch.randn(batch_size, self.noise_dim, device=z_last.device, dtype=z_last.dtype)
+            epsilon = torch.randn(
+                batch_size, self.noise_dim, device=z_last.device, dtype=z_last.dtype
+            )
         if epsilon.shape != (batch_size, self.noise_dim):
             raise ValueError(
                 f"Expected epsilon shape {(batch_size, self.noise_dim)}, got {tuple(epsilon.shape)}"
