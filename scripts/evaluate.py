@@ -34,9 +34,22 @@ def main() -> None:
     np.random.seed(SEED)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     data = load_smoke_data(
-        ROOT / "data" / "raw", smoke_fraction=1.0, val_fraction=0.2, seed=SEED
+        ROOT / "data" / "raw",
+        smoke_fraction=1.0,
+        val_fraction=0.2,
+        seed=SEED,
     )
+
+    val_loader = DataLoader(
+        RULWindowDataset(data.val),
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=torch.cuda.is_available(),
+    )
+
     test_loader = DataLoader(
         RULWindowDataset(data.test),
         batch_size=BATCH_SIZE,
@@ -46,7 +59,24 @@ def main() -> None:
     )
 
     model = _load_model(
-        CHECKPOINT_PATH, feature_dim=data.test.x.shape[-1], device=device
+        CHECKPOINT_PATH,
+        feature_dim=data.test.x.shape[-1],
+        device=device,
+    )
+
+    y_val, q50_val, q10_val, q90_val = _run_inference(
+        model=model,
+        loader=val_loader,
+        device=device,
+    )
+
+    q10_val *= 125.0
+    q90_val *= 125.0
+
+    calibration_margin = _compute_conformal_margin(
+        q10_val,
+        q90_val,
+        y_val,
     )
 
     true_rul, q50_pred, q10_pred, q90_pred = _run_inference(
@@ -55,10 +85,12 @@ def main() -> None:
         device=device,
     )
 
-    # Rescale from normalised [0, 1] space back to original RUL range
-    q10_pred = q10_pred * 125.0
-    q50_pred = q50_pred * 125.0
-    q90_pred = q90_pred * 125.0
+    q10_pred *= 125.0
+    q50_pred *= 125.0
+    q90_pred *= 125.0
+
+    q10_pred = q10_pred - calibration_margin
+    q90_pred = q90_pred + calibration_margin
 
     rmse = _rmse(true_rul, q50_pred)
     mae = _mae(true_rul, q50_pred)
@@ -67,7 +99,10 @@ def main() -> None:
     avg_width = (q90_pred - q10_pred).mean()
 
     print("Evaluation on full FD001 test set")
+    print(true_rul[:5])
+    print(q50_pred[:5])
     print(f"test_windows={len(true_rul)}")
+    print(f"calibration_margin={calibration_margin:.4f}")
     print(f"RMSE={rmse:.4f}")
     print(f"MAE={mae:.4f}")
     print(f"coverage_q10_q90={coverage:.4f}")
@@ -80,10 +115,16 @@ def _load_model(
     feature_dim: int,
     device: torch.device,
 ) -> RULModel:
-    model = RULModel(feature_dim=feature_dim, use_quantiles=True).to(device)
+    model = RULModel(
+        feature_dim=feature_dim,
+        use_quantiles=True,
+    ).to(device)
+
     state = torch.load(checkpoint_path, map_location=device)
+
     model.load_state_dict(state["model_state"])
     model.eval()
+
     return model
 
 
@@ -103,12 +144,12 @@ def _run_inference(
             y = y.to(device, non_blocking=True)
 
             pred = model(x)
+
             _assert_finite(pred, "quantile predictions")
 
             if pred.ndim != 2 or pred.shape[-1] != 3:
                 raise RuntimeError(
-                    f"Expected quantile output shape (B, 3), got {tuple(pred.shape)}. "
-                    "Make sure the checkpoint was trained with use_quantiles=True."
+                    f"Expected quantile output shape (B, 3), got {tuple(pred.shape)}."
                 )
 
             q10_all.append(pred[:, 0].cpu())
@@ -127,6 +168,23 @@ def _run_inference(
     _assert_finite_np(q90_pred, "q90 predictions")
 
     return true_rul, q50_pred, q10_pred, q90_pred
+
+
+def _compute_conformal_margin(
+    q10_val: np.ndarray,
+    q90_val: np.ndarray,
+    y_val: np.ndarray,
+    coverage_level: float = 0.9,
+) -> float:
+    errors = np.maximum.reduce(
+        [
+            q10_val - y_val,
+            y_val - q90_val,
+            np.zeros_like(y_val),
+        ]
+    )
+
+    return float(np.quantile(errors, coverage_level))
 
 
 def _rmse(target: np.ndarray, pred: np.ndarray) -> float:

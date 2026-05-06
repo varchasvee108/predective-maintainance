@@ -13,6 +13,7 @@ except ImportError as exc:
         "PyTorch is missing. Install torch before running V2 training."
     ) from exc
 from torch.utils.data import DataLoader
+from transformers import get_scheduler
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -20,13 +21,14 @@ if str(ROOT) not in sys.path:
 
 from core.data import RULWindowDataset, load_smoke_data
 from core.training import quantile_loss
+from torch.nn.functional import mse_loss
 from model.rul_model import RULModel
 
 
 SEED = 42
 BATCH_SIZE = 256
-EPOCHS = 3
-LR = 3e-4
+EPOCHS = 20
+LR = 1e-4
 
 
 def main() -> None:
@@ -55,7 +57,43 @@ def main() -> None:
 
     model = RULModel(feature_dim=data.train.x.shape[-1], use_quantiles=True).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if param.ndim < 2 or "bias" in name.lower():
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    optimizer_grouped_parameters = [
+        {
+            "params": decay_params,
+            "weight_decay": 1e-2,
+        },
+        {
+            "params": no_decay_params,
+            "weight_decay": 0.0,
+        },
+    ]
+
+    optimizer = torch.optim.AdamW(
+        optimizer_grouped_parameters,
+        lr=LR,
+        betas=(0.9, 0.95),
+    )
+
+    num_training_steps = EPOCHS * len(train_loader)
+    num_warmup_steps = int(0.05 * num_training_steps)
+    scheduler = get_scheduler(
+        "cosine_with_restarts",
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
     loss_fn = quantile_loss
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
     best_val_loss = float("inf")
@@ -65,7 +103,7 @@ def main() -> None:
 
     for epoch in range(1, EPOCHS + 1):
         train_loss = _train_one_epoch(
-            model, train_loader, optimizer, loss_fn, scaler, device
+            model, train_loader, optimizer, loss_fn, scaler, device, scheduler
         )
         val_loss = _evaluate(model, val_loader, loss_fn, device)
         print(
@@ -101,6 +139,7 @@ def _train_one_epoch(
     loss_fn,
     scaler: torch.cuda.amp.GradScaler,
     device: torch.device,
+    scheduler,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -114,8 +153,8 @@ def _train_one_epoch(
         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
             pred = model(x)
             y_norm = y / 125.0
-            pred_norm = pred / 125.0
-            loss = loss_fn(pred_norm, y_norm)
+
+            loss = quantile_loss(pred, y_norm)
 
         _assert_finite(pred, "training predictions")
         if not torch.isfinite(loss):
@@ -126,6 +165,7 @@ def _train_one_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()
 
         batch_size = int(x.shape[0])
         total_loss += float(loss.item()) * batch_size
@@ -153,8 +193,11 @@ def _evaluate(
             pred = model(x)
             _assert_finite(pred, "validation predictions")
             y_norm = y / 125.0
-            pred_norm = pred / 125.0
-            loss = loss_fn(pred_norm, y_norm)
+
+            if pred.ndim == 2 and pred.shape[1] == 3:
+                loss = quantile_loss(pred, y_norm)
+            else:
+                loss = mse_loss(pred, y_norm)
             if not torch.isfinite(loss):
                 raise RuntimeError("Validation loss is NaN or infinity.")
             batch_size = int(x.shape[0])

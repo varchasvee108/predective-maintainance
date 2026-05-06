@@ -48,17 +48,25 @@ class RULModel(nn.Module):
         self, x: torch.Tensor, epsilon: torch.Tensor | None = None
     ) -> torch.Tensor:
         z_last = self.encode(x)
+
         if self.use_residual:
             z_last = self.apply_residual(z_last, epsilon)
+
         out = self.head(z_last)
+
         if self.use_quantiles:
-            out = torch.clamp(out, 0.0, 125.0)
-            return out  # shape (B, 3)
-        return out.squeeze(-1)  # shape (B,)
+            base = out[:, 1]
+            d1 = torch.nn.functional.softplus(out[:, 0])
+            d2 = torch.nn.functional.softplus(out[:, 2])
+
+            q10 = base - d1
+            q90 = base + d2
+
+            return torch.stack([q10, base, q90], dim=1)
+
+        return out.squeeze(-1)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected input shape (B, T, F), got {tuple(x.shape)}")
         x = x.transpose(1, 2)
         z = self.encoder(x)
         z = z.transpose(1, 2)
