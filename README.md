@@ -1,65 +1,72 @@
 # Uncertainty-Aware RUL Prediction (C-MAPSS FD001)
 
-## Problem
+## 1. Problem
 
-Remaining Useful Life (RUL) models are often used to estimate how long an engine can keep operating before failure. A standard deterministic model gives one prediction per timestep, but that single number hides uncertainty exactly where it matters most. Near failure, the risk is higher and multiple plausible predictions can arise, so we want predictions that reflect both expected RUL and confidence.
+Remaining Useful Life (RUL) models are often used to estimate how long an engine can keep operating before failure. Traditional deterministic models output a single point estimate per timestep. However, single-value predictions are insufficient, especially near degradation transitions where the risk of failure increases. In predictive maintenance, understanding uncertainty and the range of plausible future states is as critical as the expected outcome itself.
 
-## Approach
+## 2. Evolution of the Project
 
-- Dataset: NASA C-MAPSS FD001
-- Input format: windowed multivariate time series with `T = 40`
-- Feature encoder: Conv1D + LSTM backbone
-- Baseline: deterministic RUL regression
-- Extension: stochastic inference through noise sampling in latent space
-- Output: multiple sampled trajectories instead of a single point estimate
+### V1 — Stochastic Latent Sampling
 
-## Key Results
+The project initially explored probabilistic forecasting through latent noise injection. By passing stochastic embeddings through the network, the model generated a spread of trajectory samples to represent uncertainty. While this exploratory approach highlighted regions of prediction difficulty, the resulting uncertainty was not properly calibrated. Much of the variance was induced by the design rather than purely learned, leading to unreliable coverage and overconfidence near critical failure regimes.
 
-- `RMSE_baseline ≈ 14.7`
-- `RMSE_stochastic ≈ 15.5`
-- `~5%` RMSE tradeoff for uncertainty-aware predictions
-- Stochastic spread increases near failure
+### V2 — Quantile Regression + Conformal Calibration
 
-The stochastic model provides a spread of predictions rather than a single point estimate. However, this uncertainty is not fully calibrated. There is an inherent tradeoff: the model accepts a slightly worse RMSE in exchange for a richer output that quantifies prediction variance as degradation accelerates.
+To address the limitations of heuristic noise, the system evolved into a formal probabilistic quantile forecasting approach. The current version predicts specific quantiles (q10, q50, q90) directly.
+* **q50** represents the median (expected) prediction.
+* **q10** and **q90** define a prediction interval that captures 80% of the expected outcomes.
 
-## Visual Results
+To ensure this interval is reliable, we apply **conformal calibration**. This post-processing step uses validation set statistics to correct the prediction intervals, ensuring the empirical coverage closely matches the target confidence level.
 
-### Trajectory with Uncertainty
+## 3. Architecture
 
-![Trajectory](outputs/plots/trajectory_main.png)
+The current system relies on:
+* **Conv1D Encoder:** Extracts local temporal patterns from the multivariate sensor data.
+* **LSTM Backbone:** Captures long-range temporal dependencies and degradation trends.
+* **Quantile Prediction Head:** Outputs calibrated prediction intervals (q10, q50, q90) instead of single deterministic predictions.
 
-The model tracks general degradation trends, but shows bias near failure. The trajectory spread grows as failure approaches, though this increase is partly due to model design rather than purely learned behavior.
+## 4. Final Results
 
-### Uncertainty Growth
+Our calibrated intervals achieve strong empirical coverage while remaining reasonably sharp.
 
-![Uncertainty](outputs/plots/uncertainty_growth.png)
+| Metric             | Value |
+| ------------------ | ----- |
+| RMSE               | 13.7  |
+| MAE                | 9.4   |
+| Coverage (q10–q90) | 0.88  |
+| Quantile Crossing  | 0.00  |
+| Avg Interval Width | 41.1  |
 
-Prediction uncertainty rises as the engine gets closer to failure. While this aligns with the late-life regime, the prediction distribution near failure may not always include the true value, indicating some overconfidence.
+## 5. Visual Results
 
-### Error vs Time-to-Failure
+### Trajectory Plot
 
-![Error](outputs/plots/error_vs_time.png)
+![Trajectory](outputs/plots/v2/trajectory_main.png)
 
-Prediction error also tends to increase near failure. The model's difficulty in this regime reinforces why exposing uncertainty is critical, even when that uncertainty is not yet perfectly aligned with true error.
+The q50 median prediction successfully tracks the degradation trend. The uncertainty adapts dynamically across different degradation stages, and the conformal intervals widen the prediction bounds conservatively to ensure robust coverage.
 
-<!-- ### Prediction Distribution
+### Calibration Coverage Plot
 
-![Prediction Distribution](outputs/plots/prediction_distribution.png)
+![Interval Misses](outputs/plots/v2/interval_misses.png)
 
-Multiple stochastic runs produce a spread of RUL predictions. This spread exposes variability in predictions near failure, though it does not yet represent a calibrated set of plausible outcomes. -->
+This plot demonstrates the empirical coverage behavior of the calibrated model. The red points indicate interval misses (where the true RUL falls outside the conformal interval). The vast majority of true values fall safely inside the calibrated intervals.
 
-## Key Insight
+### Uncertainty Width Plot
 
-Deterministic models collapse uncertainty into a single estimate, even when the future is ambiguous. This stochastic extension exposes multiple plausible outcomes, allowing for a better assessment of risk. However, current uncertainty estimates are not calibrated and may fail to reliably capture the true error near critical failure regimes. In particular, the model can be confidently wrong near failure, highlighting a gap between predictive variance and true uncertainty.
+![Uncertainty Growth](outputs/plots/v2/uncertainty_growth.png)
 
-## Limitations / Future Work
+Prediction uncertainty changes dynamically across degradation stages. Uncertainty often peaks during difficult transition regimes as the equipment begins to degrade. As terminal failure approaches and degradation becomes more predictable, the intervals begin to narrow.
 
-- **Calibration Issues**: The model tends to overestimate RUL near failure. Uncertainty is driven partly by heuristic noise scaling, and the predictive distribution does not reliably capture the true error.
-- **Improved Training**: Use likelihood-based or quantile-based training (e.g., Negative Log Likelihood or Pinball Loss) to align uncertainty estimates with actual predictive error.
-- **Architecture**: The current backbone uses an LSTM, which struggles with long-range temporal dependencies. Replacing it with a state-space model (e.g., Mamba) is expected to better capture long-horizon dynamics and improve late-stage prediction behavior.
-- **Advanced Distribution Learning**: The current stochastic approach uses simple noise injection. Extending this to a flow-matching objective is expected to enable learning a richer conditional distribution over future states.
+## 6. Key Insight
 
-## How to Run
+Transitioning from heuristic stochastic uncertainty to learned probabilistic forecasting demonstrates that uncertainty is not merely random noise. True predictive uncertainty should reflect the model's confidence and the inherent difficulty of the prediction at that specific time. In predictive maintenance, proper calibration matters just as much as point accuracy to safely inform maintenance decisions.
+
+## 7. Limitations / Future Work
+
+* **Temporal Modeling:** The current architecture uses an LSTM, which has known limitations with very long-range dependencies. Exploring state-space models (e.g., Mamba) or transformers could improve long-horizon dynamics.
+* **Architecture Extensions:** Further work could investigate multimodal extensions or richer probabilistic objectives to capture more complex predictive distributions.
+
+## 8. How to Run
 
 ```bash
 pip install -r requirements.txt
