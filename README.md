@@ -61,6 +61,22 @@ Prediction uncertainty changes dynamically across degradation stages. Uncertaint
 
 Transitioning from heuristic stochastic uncertainty to learned probabilistic forecasting demonstrates that uncertainty is not merely random noise. True predictive uncertainty should reflect the model's confidence and the inherent difficulty of the prediction at that specific time. In predictive maintenance, proper calibration matters just as much as point accuracy to safely inform maintenance decisions.
 
+## Earlier Exploratory Results (V1)
+
+Earlier versions of this project explored uncertainty through stochastic latent-space sampling. Multiple plausible RUL trajectories were generated using noise-conditioned inference to highlight regions of ambiguity during degradation progression. These uncertainty estimates were purely exploratory and not formally calibrated. V2 later replaced this approach with direct quantile forecasting and conformal calibration.
+
+### Engine 25
+
+![Engine 25](outputs/demo/engine_25.png)
+
+This trajectory illustrates the stochastic spread, exposing prediction ambiguity as the engine transitions into a degraded state.
+
+### Engine 31
+
+![Engine 31](outputs/demo/engine_31.png)
+
+Another exploratory example demonstrating the uncalibrated but informative trajectory spread during degradation progression.
+
 ## 7. Limitations / Future Work
 
 * **Temporal Modeling:** The current architecture uses an LSTM, which has known limitations with very long-range dependencies. Exploring state-space models (e.g., Mamba) or transformers could improve long-horizon dynamics.
