@@ -14,11 +14,11 @@ import torch
 from core.data import load_smoke_data
 from model.rul_model import RULModel
 
-CHECKPOINT_PATH = ROOT / "outputs" / "checkpoints" / "flow_best.pt"
-OUTPUT_DIR = ROOT / "outputs" / "demo"
+CHECKPOINT_PATH = ROOT / "outputs" / "checkpoints" / "v2" / "v2_best.pt"
+OUTPUT_DIR = ROOT / "outputs" / "demo" / "v2"
 ENGINE_IDS = (25, 31)
 SEED = 42
-STOCHASTIC_SAMPLES = 30
+CALIBRATION_MARGIN = 5.9785
 
 
 def main() -> None:
@@ -26,7 +26,7 @@ def main() -> None:
     np.random.seed(SEED)
 
     if not CHECKPOINT_PATH.exists():
-        raise FileNotFoundError(f"Flow checkpoint not found: {CHECKPOINT_PATH}")
+        raise FileNotFoundError(f"V2 checkpoint not found: {CHECKPOINT_PATH}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -53,30 +53,25 @@ def main() -> None:
             engine_id=engine_id,
             cycles=cycles,
             true_rul=true_rul,
-            mean_pred=results["mean"],
-            pred_min=results["min"],
-            pred_max=results["max"],
-            samples=results["samples"],
-            path=OUTPUT_DIR / f"engine_{engine_id}.png",
+            q50=results["q50"],
+            q10=results["q10"],
+            q90=results["q90"],
+            q10_conf=results["q10_conf"],
+            q90_conf=results["q90_conf"],
+            path=OUTPUT_DIR / f"engine_{engine_id}_v2.png",
         )
 
         print(
-            f"saved demo plot for engine {engine_id} to {OUTPUT_DIR / f'engine_{engine_id}.png'}"
+            f"saved V2 demo plot for engine {engine_id} to {OUTPUT_DIR / f'engine_{engine_id}_v2.png'}"
         )
 
 
 def _load_model(feature_dim: int, device: torch.device) -> RULModel:
-    model = RULModel(feature_dim=feature_dim).to(device)
+    model = RULModel(feature_dim=feature_dim, use_quantiles=True).to(device)
     state = torch.load(CHECKPOINT_PATH, map_location=device)
     model.load_state_dict(state["model_state"])
-    model.enable_residual(True)
     model.eval()
     return model
-
-
-def calibrate(pred: torch.Tensor) -> torch.Tensor:
-    pred = torch.clamp(pred, 0.0, 125.0)
-    return 0.95 * pred
 
 
 def _run_inference(
@@ -86,24 +81,27 @@ def _run_inference(
     _assert_finite_tensor(windows, "inference windows")
 
     with torch.no_grad():
-        stochastic_preds = []
-        for _ in range(STOCHASTIC_SAMPLES):
-            epsilon = torch.randn(
-                windows.shape[0], model.noise_dim, device=device, dtype=windows.dtype
-            )
-            pred = calibrate(model(windows, epsilon))
-            # pred = pred + 0.05 * torch.randn_like(pred) * pred.mean()
-            _assert_finite_tensor(pred, "stochastic predictions")
-            stochastic_preds.append(pred)
+        preds = model(windows)
+        preds = preds.cpu().numpy() * 125.0
+    _assert_finite_array(preds, "quantile predictions")
 
-    stochastic = torch.stack(stochastic_preds, dim=0).cpu().numpy()
-    _assert_finite_array(stochastic, "stacked stochastic predictions")
+    q10 = preds[:, 0]
+    q50 = preds[:, 1]
+    q90 = preds[:, 2]
+
+    _assert_finite_array(q10, "q10 predictions")
+    _assert_finite_array(q50, "q50 predictions")
+    _assert_finite_array(q90, "q90 predictions")
+
+    q10_conf = q10 - CALIBRATION_MARGIN
+    q90_conf = q90 + CALIBRATION_MARGIN
 
     return {
-        "samples": stochastic,
-        "mean": stochastic.mean(axis=0),
-        "min": stochastic.min(axis=0),
-        "max": stochastic.max(axis=0),
+        "q10": q10,
+        "q50": q50,
+        "q90": q90,
+        "q10_conf": q10_conf,
+        "q90_conf": q90_conf,
     }
 
 
@@ -111,10 +109,11 @@ def _plot_engine(
     engine_id: int,
     cycles: np.ndarray,
     true_rul: np.ndarray,
-    mean_pred: np.ndarray,
-    pred_min: np.ndarray,
-    pred_max: np.ndarray,
-    samples: np.ndarray,
+    q50: np.ndarray,
+    q10: np.ndarray,
+    q90: np.ndarray,
+    q10_conf: np.ndarray,
+    q90_conf: np.ndarray,
     path: Path,
 ) -> None:
     plt.figure(figsize=(10, 5), dpi=150)
@@ -124,39 +123,39 @@ def _plot_engine(
 
     plt.fill_between(
         cycles,
-        pred_min,
-        pred_max,
-        color="#4c78a8",
-        alpha=0.5,
-        label="uncertainty band",
+        q10_conf,
+        q90_conf,
+        color="#c6d4e1",
+        alpha=0.3,
+        label="conformal interval",
         zorder=1,
     )
 
-    for idx in range(min(10, samples.shape[0])):
-        plt.plot(
-            cycles,
-            samples[idx],
-            color="#7ea6d8",
-            linewidth=1.0,
-            alpha=0.2,
-            zorder=2,
-        )
+    plt.fill_between(
+        cycles,
+        q10,
+        q90,
+        color="#4c78a8",
+        alpha=0.5,
+        label="q10-q90 interval",
+        zorder=2,
+    )
 
     plt.plot(cycles, true_rul, color="black", linewidth=2.5, label="true RUL", zorder=4)
     plt.plot(
         cycles,
-        mean_pred,
+        q50,
         color="#1f77b4",
         linewidth=3,
-        label="mean prediction",
+        label="median prediction (q50)",
         zorder=3,
     )
 
-    plt.title(f"Engine {engine_id} RUL Prediction")
+    plt.title(f"Engine {engine_id} Calibrated RUL Forecast")
     plt.xlabel("Cycle")
     plt.ylabel("RUL")
     plt.grid(True, linestyle="--", linewidth=0.8, alpha=0.6)
-    plt.legend(frameon=False)
+    plt.legend(frameon=False, loc="upper right")
     plt.tight_layout()
     plt.savefig(path, bbox_inches="tight")
     plt.close()
