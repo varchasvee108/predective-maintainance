@@ -1,4 +1,4 @@
-# Uncertainty-Aware RUL Prediction (C-MAPSS FD001)
+# Uncertainty-Aware RUL Prediction 
 
 ## 1. Problem
 
